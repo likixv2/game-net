@@ -55,7 +55,10 @@ sleep 12; python3 metrics/analyze.py results/local
 ```bash
 sudo apt update && sudo apt install -y mininet openvswitch-switch python3-pip
 sudo service openvswitch-switch start
-pip3 install ryu eventlet==0.30.2 matplotlib      # see docs/LEAD3 if ryu complains
+pip3 install matplotlib
+# Ryu needs a venv with pinned packages on Python 3.10 - follow docs/LEAD3_SDN.md Step 0:
+#   python3 -m venv ~/ryuenv && source ~/ryuenv/bin/activate
+#   pip install "setuptools<66" wheel && pip install eventlet==0.33.3 dnspython==2.2.1 ryu   (+ one-line wsgi.py patch)
 sudo bash experiments/run_all.sh                   # ~5 minutes, makes results/*.png
 ```
 If Ryu will not install: `sudo bash experiments/run_all.sh none` uses static OVS rules instead (same queues, no controller).
