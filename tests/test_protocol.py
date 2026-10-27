@@ -97,6 +97,8 @@ class LossyProxy(threading.Thread):
                     self.front.sendto(data, self.client)
             except socket.timeout:
                 pass
+            except ConnectionResetError:
+                pass
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -106,18 +108,36 @@ class TestEndToEnd(unittest.TestCase):
         self.server = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "server", "server.py"), "--ip", "127.0.0.1",
              "--port", str(self.port), "--log", os.path.join(self.tmp, "server_log.csv"), "--duration", "12"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdout=None, stderr=None)
         time.sleep(0.5)
 
     def tearDown(self):
         self.server.terminate()
         self.server.wait(timeout=5)
 
+    
     def _register(self, sock):
-        sock.sendto(pk.pack_msg(pk.REGISTER, 0, 0, time.time()), ("127.0.0.1", self.port))
+        sock.sendto(
+            pk.pack_msg(pk.REGISTER, 0, 0, time.time()),
+            ("127.0.0.1", self.port)
+        )
         sock.settimeout(1)
-        data, _ = sock.recvfrom(2048)
-        return pk.unpack_msg(data)
+
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                break
+
+            # Ignore WORLD snapshots and accept only REGISTER_ACK.
+            if pk.peek_type(data) != pk.REGISTER_ACK:
+                continue
+
+            return pk.unpack_msg(data)
+
+        raise AssertionError("Did not receive REGISTER_ACK")
+
 
     def test_multiple_players_get_distinct_ids_and_repeat_gets_same_id(self):
         socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(3)]

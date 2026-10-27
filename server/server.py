@@ -117,6 +117,7 @@ def main():
                         p.last_seq = seq
                         p.x, p.y = x, y
                         log.writerow([p.pid, seq, "%.6f" % ts, "%.6f" % recv_ts])
+                        logf.flush()
                         rows += 1
                         total_rx += 1
                     else:                               # old or duplicate -> drop
