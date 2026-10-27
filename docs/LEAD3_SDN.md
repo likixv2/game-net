@@ -24,16 +24,24 @@ sudo apt update
 sudo apt install -y mininet openvswitch-switch python3-pip iperf
 sudo service openvswitch-switch start
 sudo ovs-vsctl show                      # must print something, not an error
-pip3 install ryu eventlet==0.30.2 matplotlib
-ryu-manager --version                    # must print a version
+pip3 install matplotlib
 sudo mn --test pingall                   # Mininet works if it says 0% dropped
 ```
-If `pip3 install ryu` fails or `ryu-manager` crashes with an `eventlet`/`ALREADY_HANDLED` error:
+Install Ryu in a **virtual environment**. This recipe was tested on Ubuntu 22.04.5 with Python 3.10.12 (Ryu 4.34, Open vSwitch 2.17.12):
 ```bash
 python3 -m venv ~/ryuenv && source ~/ryuenv/bin/activate
-pip install "setuptools<66" wheel && pip install eventlet==0.30.2 ryu
+pip install "setuptools<66" wheel
+pip install eventlet==0.33.3 dnspython==2.2.1 ryu
+# Ryu's REST helper imports ALREADY_HANDLED, which newer eventlet removed. Patch that one line:
+sed -i 's/from eventlet.wsgi import ALREADY_HANDLED/ALREADY_HANDLED = b""/' \
+  ~/ryuenv/lib/python3.10/site-packages/ryu/app/wsgi.py
+ryu-manager --version                    # must print: ryu-manager 4.34
 ```
-(Older Python such as 3.8-3.10 behaves best with Ryu. If nothing works, use the **fallback** below.)
+Why these versions (Python 3.10): `eventlet==0.30.2` crashes with `cannot set 'is_timeout' attribute of immutable type 'TimeoutError'`;
+an old `dnspython` crashes with `module 'collections' has no attribute 'MutableMapping'`; and newer eventlet has no `ALREADY_HANDLED`, hence the patch
+(our controller does not use Ryu's REST helper, so this is safe). On Python 3.8/3.9 the older pin `eventlet==0.30.2` also works.
+`ryu-manager` only exists inside the venv: run `source ~/ryuenv/bin/activate` in every terminal that starts the controller
+(or call `~/ryuenv/bin/ryu-manager`). If nothing works, use the **fallback** below.
 
 ## Step 1 - Start the network with the controller (10 min)
 Terminal 1 (project root):
@@ -69,6 +77,9 @@ Then in the other terminal: `sudo ovs-ofctl -O OpenFlow13 dump-flows s1`. You sh
 `n_packets` going up. Check the queues: `sudo tc -s class show dev s1-eth5` - bytes should appear in BOTH classes
 (game in the guaranteed one, noise in the other).
 
+**Tip:** write each run into its own folder (`mkdir -p /tmp/on`, then `--log /tmp/on/server_log.csv` and `--logdir /tmp/on`), then
+`sudo cp /tmp/on/* results/prio_on/ && sudo chown -R $USER results && python3 metrics/analyze.py results/prio_on`.
+
 **Proof it matters**: restart everything with `PRIORITY=off`, repeat Step 3, and compare the client's `lost=` and the latency
 (`python3 metrics/analyze.py /tmp` after copying the logs). With priority OFF the game suffers badly; with ON it stays almost unaffected.
 Show this to Lead 4 - it is the main result of the project.
@@ -96,6 +107,14 @@ sudo python3 sdn/topology.py --controller none --priority on
 Uses plain OVS rules (`set_queue:1,normal`) instead of the controller. The queues and the behaviour are identical, but explain
 honestly in the report that this is the "static flow rules" version of SDN. Use `--priority off` for the no-priority runs. The experiment runner accepts it: `sudo bash experiments/run_all.sh none`
 (note: in `none` mode the priority switch comes from the scenario automatically).
+
+## Measured result (our VM, 15 Mbps noise, one client, 20 s)
+| | priority OFF | priority ON |
+|---|---|---|
+| uplink latency mean / p95 | 71.2 / 91.8 ms | 2.3 / 2.6 ms |
+| uplink jitter | 4.73 ms | 0.09 ms |
+| loss | 0 % | 0 % |
+Use this as a sanity check: if your OFF and ON runs look the same, the priority rule or the noise is not working.
 
 ## You are DONE when
 - [ ] `pingall` shows 0% dropped
@@ -140,7 +159,14 @@ honestly in the report that this is the "static flow rules" version of SDN. Use 
 |---|---|
 | `Exception: Error creating interface pair` / leftovers | `sudo mn -c` then retry |
 | `pingall` shows 100% dropped | Ryu not running (Terminal 1) or wrong port; Ryu listens on 6653, topology uses 6653. Check Terminal 1 printed `switch ... connected` |
-| Ryu crash `cannot import name 'ALREADY_HANDLED'` | `pip install eventlet==0.30.2` (see Step 0) |
+| Ryu crash `cannot import name 'ALREADY_HANDLED'` | apply the one-line `wsgi.py` patch in Step 0 (do not downgrade eventlet on Python 3.10) |
+| Ryu crash `cannot set 'is_timeout' attribute of immutable type 'TimeoutError'` | eventlet too old for Python 3.10: `pip install eventlet==0.33.3` |
+| Ryu crash `module 'collections' has no attribute 'MutableMapping'` | `pip install dnspython==2.2.1` |
+| `ryu-manager: command not found` | the venv is not active: `source ~/ryuenv/bin/activate` |
+| `pingall` shows all `X`, nothing is listening on port 6653 (check with `ss -ltnp`) | the controller is not running; start Ryu first, then the topology |
+| client prints `no ACK, retry` / `could not register` | the network is not forwarding yet: wait for `pingall` to show 0% dropped before starting the server and client |
+| `rm: cannot remove ... Operation not permitted` in `/tmp` | Mininet runs as root, so its files are root-owned. Use a new log folder per run (`mkdir -p /tmp/on`, `--log /tmp/on/server_log.csv`, `--logdir /tmp/on`) instead of deleting |
+| `analyze.py` shows `n/a` for downlink / RTT | the client logs are named `client_<IP>_log.csv` / `client_<IP>_rtt.csv` (for example `client_10.0.0.1_log.csv`), not `client_p1_*`; copy `/tmp/on/*` as a whole |
 | `ovs-vsctl: unix:/var/run/openvswitch/db.sock: database connection failed` | `sudo service openvswitch-switch start` |
 | `dump-flows` shows nothing | use `-O OpenFlow13`; and send some traffic first (flows are installed on demand) |
 | queue stats all in one class | rule not matched: verify the game UDP port really is 5005 (`--server-port`) and that `PRIORITY=on` was set in the SAME terminal as ryu-manager |
