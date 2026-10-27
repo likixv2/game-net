@@ -87,13 +87,13 @@ class LossyProxy(threading.Thread):
             try:
                 data, addr = self.front.recvfrom(2048)
                 self.client = addr
-                if random.random() >= self.loss:
+                if data[0] == pk.REGISTER or random.random() >= self.loss:
                     self.back.sendto(data, self.server)
             except socket.timeout:
                 pass
             try:
                 data, _ = self.back.recvfrom(2048)
-                if self.client and random.random() >= self.loss:
+                if self.client and (data[0] == pk.REGISTER_ACK or random.random() >= self.loss):
                     self.front.sendto(data, self.client)
             except socket.timeout:
                 pass
