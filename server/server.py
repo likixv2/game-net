@@ -86,6 +86,8 @@ def main():
             data, addr = sock.recvfrom(2048)
         except socket.timeout:
             data = None
+        except ConnectionResetError:
+         data = None
         except OSError:
             break
 
@@ -117,6 +119,7 @@ def main():
                         p.last_seq = seq
                         p.x, p.y = x, y
                         log.writerow([p.pid, seq, "%.6f" % ts, "%.6f" % recv_ts])
+                        logf.flush()
                         rows += 1
                         total_rx += 1
                     else:                               # old or duplicate -> drop
@@ -141,9 +144,7 @@ def main():
                     p.world_seq += 1
                     sock.sendto(pk.pack_world(p.world_seq, time.time(), snapshot), p.addr)
 
-        if rows and rows % 200 == 0:
-            logf.flush()
-
+      
     logf.flush()
     logf.close()
     print("[server] done. STATE packets accepted: %d" % total_rx, flush=True)
