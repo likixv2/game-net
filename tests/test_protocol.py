@@ -116,8 +116,10 @@ class TestEndToEnd(unittest.TestCase):
     def _register(self, sock):
         sock.sendto(pk.pack_msg(pk.REGISTER, 0, 0, time.time()), ("127.0.0.1", self.port))
         sock.settimeout(1)
-        data, _ = sock.recvfrom(2048)
-        return pk.unpack_msg(data)
+        while True:                                  # skip WORLD broadcasts that arrive before the ACK
+            data, _ = sock.recvfrom(2048)
+            if pk.peek_type(data) == pk.REGISTER_ACK:
+                return pk.unpack_msg(data)
 
     def test_multiple_players_get_distinct_ids_and_repeat_gets_same_id(self):
         socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(3)]
