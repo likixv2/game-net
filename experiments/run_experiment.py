@@ -1,235 +1,134 @@
-import * as assert from 'node:assert';
-import { describe, it } from 'mocha';
-import {
-  readSnapshotFile,
-  type FileAccessResult,
-  type BoundedReadResult,
-  type SnapshotFileAccess,
-} from '../../src/core/snapshotReader';
+#!/usr/bin/env python3
+"""
+run_experiment.py - runs ONE scenario end to end (Lead 4). Needs sudo, Mininet, Open vSwitch, Ryu.
 
-interface FakeFailures {
-  readonly rejectSize?: boolean;
-  readonly rejectRead?: boolean;
+    sudo python3 experiments/run_experiment.py --scenario baseline
+    sudo python3 experiments/run_experiment.py --scenario congested_noprio
+    sudo python3 experiments/run_experiment.py --scenario congested_prio
+    sudo python3 experiments/run_experiment.py --scenario loss5
+
+What it does: starts Ryu (priority on/off) -> builds the network -> starts server, 3 clients and
+(for congestion scenarios) noise in both directions -> waits -> stops everything -> runs analyze.py.
+Logs end up in results/<scenario>/.
+
+Use --controller none to skip Ryu and use static OVS rules instead (fallback if Ryu will not install).
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(ROOT, "sdn"))
+sys.path.insert(0, ROOT)
+
+from mininet.log import setLogLevel  # noqa: E402
+from topology import build_net       # noqa: E402
+
+SCENARIOS = {
+    #                  priority, noise, random loss %
+    "baseline":         ("off", False, 0),
+    "congested_noprio": ("off", True, 0),
+    "congested_prio":   ("on",  True, 0),
+    "loss5":            ("off", False, 5),
 }
 
-class FakeAccess implements SnapshotFileAccess {
-  stats: string[] = [];
-  reads: string[] = [];
-  readCaps: number[] = [];
 
-  constructor(
-    private readonly size: FileAccessResult<number>,
-    private readonly bounded: BoundedReadResult,
-    private readonly failures: FakeFailures = {}
-  ) {}
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scenario", choices=list(SCENARIOS), required=True)
+    ap.add_argument("--duration", type=int, default=40, help="seconds the clients play")
+    ap.add_argument("--controller", choices=["ryu", "none"], default="ryu")
+    ap.add_argument("--noise-mbps", type=float, default=15)
+    args = ap.parse_args()
 
-  async fileSize(path: string): Promise<FileAccessResult<number>> {
-    this.stats.push(path);
-    if (this.failures.rejectSize) throw new Error('unexpected filesystem failure (stat)');
-    return this.size;
-  }
+    prio, noise, loss = SCENARIOS[args.scenario]
+    out = os.path.join(ROOT, "results", args.scenario)
+    os.makedirs(out, exist_ok=True)
+    for f in os.listdir(out):                 # clean old logs of this scenario
+        os.remove(os.path.join(out, f))
 
-  async readBounded(path: string, maxBytes: number): Promise<BoundedReadResult> {
-    this.reads.push(path);
-    this.readCaps.push(maxBytes);
-    if (this.failures.rejectRead) throw new Error('unexpected filesystem failure (read)');
-    return this.bounded;
-  }
-}
+    setLogLevel("warning")
+    subprocess.run("mn -c > /dev/null 2>&1", shell=True)   # clean leftovers of old runs
 
-const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
-const okNum = (value: number): FileAccessResult<number> => ({ kind: 'ok', value });
-const okBytes = (bytes: Uint8Array): BoundedReadResult => ({ kind: 'ok', bytes });
-const MISSING = { kind: 'missing' } as const;
-const STILL_MISSING = MISSING;
-const ERR = { kind: 'error', detail: 'fake failure' } as const;
-const TOO_LARGE = { kind: 'too-large' } as const;
+    ryu = None
+    if args.controller == "ryu":
+        env = dict(os.environ, PRIORITY=prio)
+        ryu = subprocess.Popen(["ryu-manager", os.path.join(ROOT, "sdn", "controller.py")], env=env,
+                               stdout=open(os.path.join(out, "ryu.log"), "w"), stderr=subprocess.STDOUT)
+        time.sleep(3)                         # let it start listening
 
-const opts = (access: SnapshotFileAccess, maxBytes = 10) => ({ access, maxBytes });
+    net = build_net(args.controller, prio)
+    procs = []
+    try:
+        time.sleep(3)                         # let switches connect to the controller
+        p1, p2, p3 = net.get("p1", "p2", "p3")
+        n1, n2, srv = net.get("n1", "n2", "srv")
+        srv_ip = srv.IP()
+        players = [p1, p2, p3]
 
-describe('snapshotReader', () => {
-  it('reads a valid text file and returns its content', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')));
-    const result = await readSnapshotFile('src/app.ts', opts(access));
-    assert.deepStrictEqual(result, { kind: 'text', text: 'hello' });
-    assert.deepStrictEqual(access.stats, ['src/app.ts']);
-    assert.deepStrictEqual(access.reads, ['src/app.ts']);
-  });
+        print("[exp] connectivity check:")
+        print(net.pingAll())
 
-  it('accepts an empty file as empty text', async () => {
-    const access = new FakeAccess(okNum(0), okBytes(utf8('')));
-    assert.deepStrictEqual(await readSnapshotFile('empty.txt', opts(access)), {
-      kind: 'text',
-      text: '',
-    });
-  });
+        if loss:                              # random loss on every player and on the server
+            # "replace" (not "add"): the server link already has a netem qdisc for its 2 ms delay, and
+            # "add" would fail silently with "File exists". Keep that delay on the server.
+            tc_log = []
+            for h in players + [srv]:
+                delay = "delay 2ms " if h.name == "srv" else ""
+                tc_log.append(h.cmd("tc qdisc replace dev %s-eth0 root netem %sloss %d%%" % (h.name, delay, loss)))
+            with open(out + "/tc_loss_setup.txt", "w") as f:       # evidence for the report
+                f.write("".join(tc_log))
+                for h in players + [srv]:
+                    f.write("--- %s\n%s\n" % (h.name, h.cmd("tc qdisc show dev %s-eth0" % h.name)))
 
-  it('rejects an IGNORED path before any filesystem call — not even stat', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')));
-    const result = await readSnapshotFile('node_modules/pkg/index.js', opts(access));
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'ignored' });
-    assert.deepStrictEqual(access.stats, [], 'fileSize must never be called');
-    assert.deepStrictEqual(access.reads, [], 'readBounded must never be called');
-  });
+        total = args.duration + 8
+        procs.append(srv.popen("python3 %s/server/server.py --ip 0.0.0.0 --port 5005 --log %s/server_log.csv --duration %d"
+                               % (ROOT, out, total),
+                               stdout=open(out + "/server.out", "w"), stderr=subprocess.STDOUT))
+        time.sleep(1)
 
-  it('honors extraIgnoredFolders with the same segment rules as M1', async () => {
-    const access = new FakeAccess(okNum(1), okBytes(utf8('x')));
-    const result = await readSnapshotFile('secrets/keys.env', {
-      access,
-      maxBytes: 10,
-      extraIgnoredFolders: ['secrets'],
-    });
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'ignored' });
-    assert.strictEqual(access.stats.length + access.reads.length, 0);
-  });
+        if noise:                             # sinks first, then floods in BOTH directions
+            procs.append(n2.popen("python3 %s/tools/noise.py sink --port 6000" % ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            procs.append(n1.popen("python3 %s/tools/noise.py sink --port 6000" % ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            time.sleep(1)
+            procs.append(n1.popen("python3 %s/tools/noise.py send --ip %s --port 6000 --mbps %s --duration %d"
+                                  % (ROOT, n2.IP(), args.noise_mbps, args.duration + 4), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            procs.append(n2.popen("python3 %s/tools/noise.py send --ip %s --port 6000 --mbps %s --duration %d"
+                                  % (ROOT, n1.IP(), args.noise_mbps, args.duration + 4), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            time.sleep(2)                     # let the queues fill up before the game starts
 
-  it('rejects an oversized file from metadata alone, WITHOUT reading contents', async () => {
-    const access = new FakeAccess(okNum(11), okBytes(utf8('never-read-me')));
-    const result = await readSnapshotFile('big.txt', opts(access));
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
-    assert.deepStrictEqual(access.reads, [], 'oversized content must never be read');
-  });
+        clients = []
+        for h in players:
+            clients.append(h.popen("python3 %s/client/client.py --server-ip %s --name %s --duration %d --logdir %s"
+                                   % (ROOT, srv_ip, h.name, args.duration, out),
+                                   stdout=open("%s/%s.out" % (out, h.name), "w"), stderr=subprocess.STDOUT))
+        print("[exp] playing for %d s ..." % args.duration)
+        for c in clients:
+            c.wait()
+        time.sleep(3)
 
-  it('accepts a file exactly at the size cap', async () => {
-    const access = new FakeAccess(okNum(10), okBytes(utf8('1234567890')));
-    assert.deepStrictEqual(await readSnapshotFile('exact.txt', opts(access)), {
-      kind: 'text',
-      text: '1234567890',
-    });
-  });
+        # peek at the switch counters for the report (queue usage)
+        with open(out + "/ovs_queue_stats.txt", "w") as f:
+            f.write(subprocess.run("ovs-vsctl list queue; ovs-ofctl -O OpenFlow13 dump-flows s1; "
+                                   "ovs-ofctl -O OpenFlow13 queue-stats s1", shell=True,
+                                   capture_output=True, text=True).stdout)
+    finally:
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        net.stop()
+        if ryu:
+            ryu.terminate()
+        subprocess.run("mn -c > /dev/null 2>&1", shell=True)
 
-  it('an adapter-side too-large passes through WITHOUT any content being exposed', async () => {
-    const access = new FakeAccess(okNum(6), TOO_LARGE);
-    const result = await readSnapshotFile('bounded-big.ts', opts(access));
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
-  });
+    subprocess.run([sys.executable, os.path.join(ROOT, "metrics", "analyze.py"), out])
 
-  it('a FAULTY adapter returning oversized ok-bytes is rejected by the reader', async () => {
-    const access = new FakeAccess(okNum(6), okBytes(utf8('twelve chars')));
-    const result = await readSnapshotFile('faulty.ts', opts(access));
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
-  });
 
-  it('bytes larger than metadata but still within the cap are read as text, never truncated', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('1234567890')));
-    assert.deepStrictEqual(await readSnapshotFile('growing-but-fits.ts', opts(access)), {
-      kind: 'text',
-      text: '1234567890',
-    });
-    assert.deepStrictEqual(access.readCaps, [10]);
-  });
-
-  it('reports binary content by decoding the accepted bytes', async () => {
-    const access = new FakeAccess(okNum(3), okBytes(Uint8Array.from([65, 0, 66])));
-    assert.deepStrictEqual(await readSnapshotFile('img.bin', opts(access)), {
-      kind: 'unavailable',
-      reason: 'binary',
-    });
-  });
-
-  it('reports a missing file as absent without reading', async () => {
-    const access = new FakeAccess(MISSING, okBytes(utf8('untouched')));
-    assert.deepStrictEqual(await readSnapshotFile('gone.ts', opts(access)), { kind: 'absent' });
-    assert.deepStrictEqual(access.reads, []);
-  });
-
-  it('reports an unreadable stat (e.g. permissions) without reading', async () => {
-    const access = new FakeAccess(ERR, okBytes(utf8('untouched')));
-    assert.deepStrictEqual(await readSnapshotFile('locked.ts', opts(access)), {
-      kind: 'unavailable',
-      reason: 'unreadable',
-    });
-    assert.deepStrictEqual(access.reads, []);
-  });
-
-  it('a file deleted between measuring and reading is absent, not a crash', async () => {
-    const access = new FakeAccess(okNum(5), STILL_MISSING);
-    assert.deepStrictEqual(await readSnapshotFile('vanishing.ts', opts(access)), { kind: 'absent' });
-  });
-
-  it('a read error mid-flight is unreadable, not a crash', async () => {
-    const access = new FakeAccess(okNum(5), ERR);
-    assert.deepStrictEqual(await readSnapshotFile('flaky.ts', opts(access)), {
-      kind: 'unavailable',
-      reason: 'unreadable',
-    });
-  });
-
-  it('passes the configured limit to readBounded, not the default', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')));
-    await readSnapshotFile('cap.ts', opts(access, 5));
-    assert.deepStrictEqual(access.readCaps, [5], 'adapter must receive the caller cap');
-  });
-
-  it('passes the default 1 MB limit to readBounded when no cap is configured', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')));
-    await readSnapshotFile('default-cap.ts', { access });
-    assert.deepStrictEqual(access.readCaps, [1024 * 1024]);
-  });
-
-  it('turns a REJECTED fileSize() promise into unreadable instead of throwing', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')), { rejectSize: true });
-    assert.deepStrictEqual(await readSnapshotFile('broken-stat.ts', opts(access)), {
-      kind: 'unavailable',
-      reason: 'unreadable',
-    });
-    assert.deepStrictEqual(access.reads, [], 'a failed stat must not be followed by a read');
-  });
-
-  it('turns a REJECTED readBounded() promise into unreadable instead of throwing', async () => {
-    const access = new FakeAccess(okNum(5), okBytes(utf8('hello')), { rejectRead: true });
-    assert.deepStrictEqual(await readSnapshotFile('broken-read.ts', opts(access)), {
-      kind: 'unavailable',
-      reason: 'unreadable',
-    });
-    assert.deepStrictEqual(access.reads, ['broken-read.ts']);
-  });
-
-  it('fails closed on an invalid cap (negative, NaN, infinite) without any filesystem call', async () => {
-    const invalidCaps = [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
-    for (const badCap of invalidCaps) {
-      const access = new FakeAccess(okNum(5), okBytes(utf8('hello')));
-      assert.deepStrictEqual(
-        await readSnapshotFile('cap.ts', opts(access, badCap)),
-        { kind: 'unavailable', reason: 'unreadable' },
-        `cap ${badCap} must be unreadable`
-      );
-      assert.strictEqual(access.stats.length + access.reads.length, 0, 'no filesystem access');
-    }
-  });
-
-  it('treats a zero cap as valid: only an empty file is accepted', async () => {
-    const emptyAccess = new FakeAccess(okNum(0), okBytes(utf8('')));
-    assert.deepStrictEqual(await readSnapshotFile('empty.txt', opts(emptyAccess, 0)), {
-      kind: 'text',
-      text: '',
-    });
-
-    const oneByte = new FakeAccess(okNum(1), okBytes(utf8('x')));
-    assert.deepStrictEqual(await readSnapshotFile('one.txt', opts(oneByte, 0)), {
-      kind: 'unavailable',
-      reason: 'too-large',
-    });
-    assert.deepStrictEqual(oneByte.reads, []);
-  });
-
-  it('fails closed on invalid metadata (negative, NaN, infinite) without reading', async () => {
-    const invalidSizes = [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
-    for (const badSize of invalidSizes) {
-      const access = new FakeAccess(okNum(badSize), okBytes(utf8('hello')));
-      assert.deepStrictEqual(
-        await readSnapshotFile('odd-stat.ts', opts(access)),
-        { kind: 'unavailable', reason: 'unreadable' },
-        `size ${badSize} must be unreadable`
-      );
-      assert.deepStrictEqual(access.reads, [], 'invalid metadata must not cause a read');
-    }
-  });
-
-  it('defaults the per-file cap to snapshotText\'s 1 MB limit', async () => {
-    const access = new FakeAccess(okNum(1024 * 1024 + 1), okBytes(new Uint8Array(1024 * 1024 + 1)));
-    const result = await readSnapshotFile('defaults.ts', { access });
-    assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
-    assert.deepStrictEqual(access.reads, []);
-  });
-});
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("run me with sudo")
+    main()
