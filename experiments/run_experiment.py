@@ -7,6 +7,12 @@ import {
   type SnapshotFileAccess,
 } from '../../src/core/snapshotReader';
 
+/** Lets a test make one of the fake filesystem methods reject instead of return. */
+interface FakeFailures {
+  readonly rejectSize?: boolean;
+  readonly rejectRead?: boolean;
+}
+
 /**
  * A fake filesystem that counts every call it receives. Counting is the
  * point of several tests: for ignored and oversized paths, the assertion is
@@ -18,11 +24,6 @@ import {
  * reader's exception handling is tested: an adapter bug, not an expected
  * condition.
  */
-interface FakeFailures {
-  readonly rejectSize?: boolean;
-  readonly rejectRead?: boolean;
-}
-
 class FakeAccess implements SnapshotFileAccess {
   stats: string[] = [];
   reads: string[] = [];
