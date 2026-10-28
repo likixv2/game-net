@@ -7,17 +7,14 @@ import {
   type SnapshotFileAccess,
 } from '../../src/core/snapshotReader';
 
-/** Lets a test make one of the fake filesystem methods reject instead of return. */
 interface FakeFailures {
   readonly rejectSize?: boolean;
   readonly rejectRead?: boolean;
 }
 
-
 class FakeAccess implements SnapshotFileAccess {
   stats: string[] = [];
   reads: string[] = [];
-  /** The maxBytes argument each readBounded() call actually received. */
   readCaps: number[] = [];
 
   constructor(
@@ -48,7 +45,6 @@ const STILL_MISSING = MISSING;
 const ERR = { kind: 'error', detail: 'fake failure' } as const;
 const TOO_LARGE = { kind: 'too-large' } as const;
 
-/** Small custom cap keeps tests tiny; production default is the 1 MB constant. */
 const opts = (access: SnapshotFileAccess, maxBytes = 10) => ({ access, maxBytes });
 
 describe('snapshotReader', () => {
@@ -103,25 +99,18 @@ describe('snapshotReader', () => {
   });
 
   it('an adapter-side too-large passes through WITHOUT any content being exposed', async () => {
-    // The correct adapter rejects before handing bytes out; the reader must
-    // report 'too-large' and must not have any content to decode.
-    const access = new FakeAccess(okNum(6), TOO_LARGE); // e.g. grew past the cap after stat
+    const access = new FakeAccess(okNum(6), TOO_LARGE);
     const result = await readSnapshotFile('bounded-big.ts', opts(access));
     assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
   });
 
   it('a FAULTY adapter returning oversized ok-bytes is rejected by the reader', async () => {
-    // Contract violation: ok results must never exceed maxBytes. The reader
-    // is the last line of defense — it refuses without decoding.
-    const access = new FakeAccess(okNum(6), okBytes(utf8('twelve chars'))); // 12 > cap 10
+    const access = new FakeAccess(okNum(6), okBytes(utf8('twelve chars')));
     const result = await readSnapshotFile('faulty.ts', opts(access));
     assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
   });
 
   it('bytes larger than metadata but still within the cap are read as text, never truncated', async () => {
-    // Metadata said 5 bytes, the read delivered exactly 10 (the cap). The
-    // reader judges the REAL bytes it holds, so this is valid text and
-    // nothing is cut off. Distinct from the 12 > cap 10 rejection above.
     const access = new FakeAccess(okNum(5), okBytes(utf8('1234567890')));
     assert.deepStrictEqual(await readSnapshotFile('growing-but-fits.ts', opts(access)), {
       kind: 'text',
@@ -238,8 +227,6 @@ describe('snapshotReader', () => {
   });
 
   it('defaults the per-file cap to snapshotText\'s 1 MB limit', async () => {
-    // No maxBytes option → the default is DEFAULT_MAX_FILE_BYTES (queried
-    // via behavior, not internals): a file > 1 MB is rejected unread.
     const access = new FakeAccess(okNum(1024 * 1024 + 1), okBytes(new Uint8Array(1024 * 1024 + 1)));
     const result = await readSnapshotFile('defaults.ts', { access });
     assert.deepStrictEqual(result, { kind: 'unavailable', reason: 'too-large' });
