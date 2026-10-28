@@ -13,17 +13,7 @@ interface FakeFailures {
   readonly rejectRead?: boolean;
 }
 
-/**
- * A fake filesystem that counts every call it receives. Counting is the
- * point of several tests: for ignored and oversized paths, the assertion is
- * not just the returned reason but that the underlying filesystem was
- * never touched at all (not even a stat). It also records the maxBytes
- * argument each read actually received, so a wrong cap is caught.
- *
- * The optional failures flag makes a method REJECT, which is how the
- * reader's exception handling is tested: an adapter bug, not an expected
- * condition.
- */
+
 class FakeAccess implements SnapshotFileAccess {
   stats: string[] = [];
   reads: string[] = [];
