@@ -10,8 +10,10 @@ What it does
         - if seq jumped (e.g. 7 -> 10)            -> packets 8 and 9 were LOST, count them
         - the newest snapshot replaces the old one (full snapshots, so a lost one is just
           skipped; meanwhile we keep showing the last known positions)
+        - every WORLD packet also carries an ACK of our STATE packets (ack_seq + ack_bits),
+          so we learn exactly which of OUR packets were lost (uplink loss)
   4. once a second sends a PING and measures round-trip time (RTT)
-  5. writes CSV logs for the analyzer
+  5. writes CSV logs for the analyzer, plus client_<name>_loss.csv with uplink/downlink loss
 
 Run:  python3 client/client.py --server-ip 127.0.0.1 --name p1 --duration 30
 """
@@ -25,6 +27,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common import packet as pk  # noqa: E402
+from common.ack import AckTracker  # noqa: E402
 
 
 def register(sock, server, tries=3, wait=1.0):
@@ -79,6 +82,7 @@ def main():
     last_world_seq = 0      # newest WORLD seq we accepted
     sent = recvd = lost = stale = 0
     world = {}              # last known positions of all players: pid -> (x, y)
+    acks = AckTracker()     # which of OUR packets the server confirmed (uplink loss)
     interval = 1.0 / args.rate
     start = time.time()
     next_send = start
@@ -117,9 +121,10 @@ def main():
             t = pk.peek_type(data)
             if t == pk.WORLD:
                 try:
-                    wseq, wts, players = pk.unpack_world(data)
+                    wseq, wts, players, ack_seq, ack_bits = pk.unpack_world_full(data)
                 except ValueError:
                     continue
+                acks.on_ack(ack_seq, ack_bits)         # server tells us which STATE packets arrived
                 if wseq <= last_world_seq:
                     stale += 1                         # old / duplicate: ignore
                 else:
@@ -138,12 +143,26 @@ def main():
 
         if now >= next_report:
             next_report += 5.0
-            print("[client %s] t=%3ds sent=%d recv=%d lost=%d stale=%d players_seen=%d"
-                  % (args.name, now - start, sent, recvd, lost, stale, len(world)), flush=True)
+            up_exp, up_got, up_lost = acks.summary()
+            print("[client %s] t=%3ds sent=%d recv=%d lost=%d stale=%d players_seen=%d up_acked=%d/%d up_lost=%d"
+                  % (args.name, now - start, sent, recvd, lost, stale, len(world), up_got, up_exp, up_lost),
+                  flush=True)
 
     world_f.close()
     rtt_f.close()
-    print("[client %s] FINISHED sent=%d recv=%d lost=%d stale=%d" % (args.name, sent, recvd, lost, stale), flush=True)
+
+    # ---- loss summary, both directions, measured by the client itself ----
+    up_exp, up_got, up_lost = acks.summary()          # uplink: confirmed by server acks
+    down_exp = last_world_seq                          # downlink: gaps in WORLD seq
+    down_lost = down_exp - recvd
+    with open(os.path.join(args.logdir, "client_%s_loss.csv" % args.name), "w", newline="") as lf:
+        w = csv.writer(lf)
+        w.writerow(["direction", "expected", "received", "lost", "loss_pct"])
+        w.writerow(["uplink", up_exp, up_got, up_lost, "%.2f" % (100.0 * up_lost / up_exp if up_exp else 0)])
+        w.writerow(["downlink", down_exp, recvd, down_lost,
+                    "%.2f" % (100.0 * down_lost / down_exp if down_exp else 0)])
+    print("[client %s] FINISHED sent=%d recv=%d lost=%d stale=%d | uplink lost %d/%d | downlink lost %d/%d"
+          % (args.name, sent, recvd, lost, stale, up_lost, up_exp, down_lost, down_exp), flush=True)
 
 
 if __name__ == "__main__":

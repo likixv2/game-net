@@ -7,9 +7,9 @@ Two packet shapes are used:
    Fixed 22 bytes:  type(1) | player_id(1) | seq(4) | timestamp(8) | x(4) | y(4)
 
 2) Server -> Client "WORLD" snapshot (variable length)
-   Header 14 bytes: type(1) | seq(4) | timestamp(8) | count(1)
+   Header 22 bytes: type(1) | seq(4) | timestamp(8) | count(1) | ack_seq(4) | ack_bits(4)
    then `count` entries of 9 bytes each: player_id(1) | x(4) | y(4)
-
+   ack_seq / ack_bits acknowledge the client's STATE packets (see common/ack.py).
 All numbers are big-endian ("network byte order"), hence the "!" in struct formats.
 """
 import struct
@@ -31,7 +31,7 @@ NOISE_PORT = 6000  # background congestion traffic uses this port
 
 # ---- struct formats ------------------------------------------------------
 _MSG = struct.Struct("!BBIdff")      # 1+1+4+8+4+4 = 22 bytes
-_WORLD_HDR = struct.Struct("!BIdB")  # 1+4+8+1     = 14 bytes
+_WORLD_HDR = struct.Struct("!BIdBII")  # 1+4+8+1+4+4 = 22 bytes
 _WORLD_ENT = struct.Struct("!Bff")   # 1+4+4       = 9 bytes
 
 MSG_SIZE = _MSG.size
@@ -49,20 +49,20 @@ def unpack_msg(data):
     return _MSG.unpack(data)
 
 
-def pack_world(seq, timestamp, players):
-    """players = {player_id: (x, y)}. Returns bytes."""
+def pack_world(seq, timestamp, players, ack_seq=0, ack_bits=0):
+    """players = {player_id: (x, y)}. ack_seq/ack_bits acknowledge the receiver's STATE packets."""
     items = list(players.items())[:255]
-    out = _WORLD_HDR.pack(WORLD, seq, timestamp, len(items))
+    out = _WORLD_HDR.pack(WORLD, seq, timestamp, len(items), ack_seq, ack_bits & 0xFFFFFFFF)
     for pid, (x, y) in items:
         out += _WORLD_ENT.pack(pid, x, y)
     return out
 
 
-def unpack_world(data):
-    """Return (seq, timestamp, {player_id: (x, y)}). Raises ValueError if bad."""
+def unpack_world_full(data):
+    """Return (seq, timestamp, {player_id: (x, y)}, ack_seq, ack_bits). Raises ValueError if bad."""
     if len(data) < _WORLD_HDR.size:
         raise ValueError("world packet too short")
-    msg_type, seq, ts, count = _WORLD_HDR.unpack_from(data, 0)
+    msg_type, seq, ts, count, ack_seq, ack_bits = _WORLD_HDR.unpack_from(data, 0)
     if msg_type != WORLD:
         raise ValueError("not a WORLD packet")
     expected = _WORLD_HDR.size + count * _WORLD_ENT.size
@@ -74,7 +74,12 @@ def unpack_world(data):
         pid, x, y = _WORLD_ENT.unpack_from(data, offset)
         players[pid] = (x, y)
         offset += _WORLD_ENT.size
-    return seq, ts, players
+    return seq, ts, players, ack_seq, ack_bits
+
+
+def unpack_world(data):
+    """Backward-compatible: (seq, timestamp, players). Use unpack_world_full for the ack fields."""
+    return unpack_world_full(data)[:3]
 
 
 def peek_type(data):

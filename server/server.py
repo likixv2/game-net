@@ -27,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from common import packet as pk  # noqa: E402
-
+from common.ack import RecvWindow  # noqa: E402
 TICK = 0.05           # 20 broadcasts per second
 PLAYER_TIMEOUT = 5.0  # forget a player we have not heard from for this long
 ANNOUNCE_EVERY = 2.0  # re-announce registered players to the SDN controller this often (heartbeat)
@@ -59,7 +59,7 @@ class Player:
         self.y = 0.0
         self.world_seq = 0      # seq counter for WORLD packets sent TO this player
         self.stale = 0          # duplicates / out-of-order packets dropped
-
+        self.rx = RecvWindow()  # which STATE seqs we have received (acked back in WORLD packets)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -140,7 +140,8 @@ def main():
                 p = players.get(addr_to_pid.get(addr))
                 if p is not None:
                     p.last_seen = recv_ts
-                    if seq > p.last_seq:                # NEW packet -> accept
+                    p.rx.on_packet(seq)                 # record for acks (even late/out-of-order ones)
+                    if seq > p.last_seq:                # NEW packet -> accept                # NEW packet -> accept
                         p.last_seq = seq
                         p.x, p.y = x, y
                         log.writerow([p.pid, seq, "%.6f" % ts, "%.6f" % recv_ts])
@@ -167,8 +168,8 @@ def main():
                 snapshot = {i: (p.x, p.y) for i, p in players.items()}
                 for p in players.values():
                     p.world_seq += 1
-                    sock.sendto(pk.pack_world(p.world_seq, time.time(), snapshot), p.addr)
-
+                    sock.sendto(pk.pack_world(p.world_seq, time.time(), snapshot,
+                                              p.rx.highest, p.rx.bits), p.addr)
         if now >= next_announce:               # heartbeat to the SDN controller
             next_announce += ANNOUNCE_EVERY
             for p in players.values():
@@ -181,8 +182,8 @@ def main():
     logf.close()
     print("[server] done. STATE packets accepted: %d" % total_rx, flush=True)
     for p in players.values():
-        print("[server]   player %d: last_seq=%d stale_dropped=%d world_sent=%d"
-              % (p.pid, p.last_seq, p.stale, p.world_seq), flush=True)
+                print("[server]   player %d: last_seq=%d stale_dropped=%d world_sent=%d uplink_received=%d uplink_missing=%d"
+              % (p.pid, p.last_seq, p.stale, p.world_seq, p.rx.count, p.rx.highest - p.rx.count), flush=True)
 
 
 if __name__ == "__main__":
