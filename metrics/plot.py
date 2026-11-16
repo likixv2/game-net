@@ -16,15 +16,19 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
 ORDER = ["baseline", "congested_noprio", "congested_prio", "loss5"]
+BURST = ["burst_noprio", "burst_static", "burst_dynamic"]
 LABELS = {"baseline": "Baseline (no noise)", "congested_noprio": "Congestion, no priority",
-          "congested_prio": "Congestion, SDN priority", "loss5": "5% random loss"}
+          "congested_prio": "Congestion, SDN priority", "loss5": "5% random loss",
+          "burst_noprio": "Burst, no priority", "burst_static": "Burst, static priority",
+          "burst_dynamic": "Burst, dynamic SDN"}
 COLORS = {"baseline": "#7a7f87", "congested_noprio": "#d9622b",
-          "congested_prio": "#2a6fdb", "loss5": "#7b5ea7"}
+          "congested_prio": "#2a6fdb", "loss5": "#7b5ea7",
+          "burst_noprio": "#d9622b", "burst_static": "#7a7f87", "burst_dynamic": "#2a6fdb"}
 
 
-def load():
+def load(names=ORDER):
     data = {}
-    for name in ORDER:
+    for name in names:
         p = os.path.join(ROOT, name, "summary.json")
         if os.path.exists(p):
             with open(p) as f:
@@ -93,6 +97,83 @@ def latency_over_time(data):
     plt.close(fig)
 
 
+def read_events(name):
+    """controller_events.csv -> list of (epoch, event, detail)"""
+    path = os.path.join(ROOT, name, "controller_events.csv")
+    out = []
+    if os.path.exists(path):
+        with open(path) as f:
+            for row in csv.DictReader(f):
+                out.append((float(row["time"]), row["event"], row["detail"]))
+    return out
+
+
+def dynamic_timeline(burst):
+    """Latency over time for the three burst scenarios + bottleneck utilisation seen by the controller.
+    Shaded band = noise burst; dashed lines = the dynamic controller switching priority on / off."""
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True, gridspec_kw={"height_ratios": [3, 1.5]})
+    t0 = None
+    for name in burst:
+        path = os.path.join(ROOT, name, "server_log.csv")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            pts = sorted((float(r["recv_ts"]), (float(r["recv_ts"]) - float(r["send_ts"])) * 1000)
+                         for r in csv.DictReader(f))
+        if not pts:
+            continue
+        start = pts[0][0]
+        buckets = {}
+        for t, l in pts:
+            buckets.setdefault(int(t - start), []).append(l)
+        xs = sorted(buckets)
+        ax.plot(xs, [sum(buckets[x]) / len(buckets[x]) for x in xs], color=COLORS[name], linewidth=2, label=LABELS[name])
+        ev_path = os.path.join(ROOT, name, "events.json")
+        if os.path.exists(ev_path):
+            with open(ev_path) as f:
+                ev = json.load(f)
+            if "noise_start" in ev:
+                ax.axvspan(ev["noise_start"] - start, ev["noise_stop"] - start, color="#d9622b", alpha=0.07)
+                ax2.axvspan(ev["noise_start"] - start, ev["noise_stop"] - start, color="#d9622b", alpha=0.07)
+        if name == "burst_dynamic":
+            t0 = start
+            for t, e, d in read_events(name):
+                if e in ("priority_on", "priority_off"):
+                    for a in (ax, ax2):
+                        a.axvline(t - start, color="#2a6fdb", linestyle="--", linewidth=1.2)
+                    ax.text(t - start + 0.4, ax.get_ylim()[1] * 0.92, e.replace("_", " "), color="#2a6fdb", fontsize=8)
+            rates = [(t - start, float(d)) for t, e, d in read_events(name) if e == "rate_mbps"]
+            if rates:
+                ax2.plot([r[0] for r in rates], [r[1] for r in rates], color="#2a6fdb", linewidth=2)
+                ax2.axhline(8, color="#888", linestyle=":", linewidth=1)
+                ax2.text(0.5, 8.3, "congestion threshold (80%)", fontsize=8, color="#666")
+    ax.legend(frameon=False, loc="upper left")
+    style(ax, "Game latency during a noise burst (shaded), 1 s average", "latency (ms)")
+    style(ax2, "Bottleneck utilisation seen by the controller", "Mbps")
+    ax2.set_xlabel("time (s)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(ROOT, "dynamic_timeline.png"), dpi=160)
+    plt.close(fig)
+
+
+def burst_table(data):
+    lines = ["| Scenario | Latency during burst mean / p95 / max (ms) | First 5 s of burst mean (ms) | Last 15 s of burst mean (ms) | Controller reaction (s) | Priority removed after burst (s) |",
+             "|---|---|---|---|---|---|"]
+
+    def f(v):
+        return "n/a" if v is None else "%.2f" % v
+    for n, s in data.items():
+        b = s.get("burst")
+        if not b:
+            continue
+        lines.append("| %s | %s / %s / %s | %s | %s | %s | %s |" % (
+            LABELS[n], f(b["latency_mean_ms"]), f(b["latency_p95_ms"]), f(b["latency_max_ms"]),
+            f(b["latency_first5s_mean_ms"]), f(b["latency_last15s_mean_ms"]),
+            f(b["reaction_s"]), f(b["priority_off_after_s"])))
+    with open(os.path.join(ROOT, "burst_table.md"), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def table(data):
     lines = ["| Scenario | Uplink latency mean / p95 (ms) | Uplink jitter (ms) | Uplink loss (%) | Downlink latency mean (ms) | Downlink jitter (ms) | Downlink loss (%) | RTT mean (ms) |",
              "|---|---|---|---|---|---|---|---|"]
@@ -109,8 +190,15 @@ def table(data):
 
 
 if __name__ == "__main__":
+    burst_data = load(BURST)
+    if burst_data:
+        dynamic_timeline(list(burst_data))
+        burst_table(burst_data)
+        print("wrote dynamic_timeline.png and burst_table.md")
     data = load()
     if not data:
+        if burst_data:
+            raise SystemExit(0)
         raise SystemExit("no summary.json found - run analyze.py on your result folders first")
     grouped_bars(data, [("mean", lambda s: s["uplink"]["latency_mean_ms"]),
                         ("95th percentile", lambda s: s["uplink"]["latency_p95_ms"])],

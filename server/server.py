@@ -10,7 +10,12 @@ What it does
   * every 50 ms (20 Hz) sends a WORLD snapshot to every player
   * logs every STATE packet it receives to a CSV (used for latency/jitter/loss)
 
+  * (optional) tells the SDN controller about application events: REGISTER <ip> <id> when a player
+    joins, LEAVE <ip> <id> when one times out, repeated every 2 s as a heartbeat. The controller uses
+    this to decide whose packets may use the priority queue (see sdn/controller.py).
+
 Run:  python3 server/server.py --port 5005 --log results/server_log.csv --duration 60
+      python3 server/server.py --control-sock /tmp/gamenet_ctrl.sock      (notify the SDN controller)
 """
 import argparse
 import csv
@@ -25,6 +30,23 @@ from common import packet as pk  # noqa: E402
 
 TICK = 0.05           # 20 broadcasts per second
 PLAYER_TIMEOUT = 5.0  # forget a player we have not heard from for this long
+ANNOUNCE_EVERY = 2.0  # re-announce registered players to the SDN controller this often (heartbeat)
+
+
+class ControlChannel:
+    """Best-effort messages to the SDN controller over a Unix datagram socket. Never raises."""
+
+    def __init__(self, path):
+        self.path = path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) if path else None
+
+    def send(self, command, ip, pid):
+        if not self.sock:
+            return
+        try:
+            self.sock.sendto(("%s %s %d" % (command, ip, pid)).encode("ascii"), self.path)
+        except OSError:
+            pass            # controller not running (yet): the heartbeat will tell it later
 
 
 class Player:
@@ -46,6 +68,8 @@ def main():
     ap.add_argument("--log", default="results/server_log.csv")
     ap.add_argument("--duration", type=float, default=0, help="stop after N seconds (0 = run until Ctrl+C)")
     ap.add_argument("--max-players", type=int, default=32)
+    ap.add_argument("--control-sock", default=os.environ.get("GAMENET_CTRL_SOCK", ""),
+                    help="Unix socket of the SDN controller; empty = do not notify it")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.log)), exist_ok=True)
@@ -59,6 +83,8 @@ def main():
     sock.settimeout(0.005)
     print("[server] listening on %s:%d" % (args.ip, args.port), flush=True)
 
+    control = ControlChannel(args.control_sock)
+    next_announce = time.time() + ANNOUNCE_EVERY
     players = {}        # pid -> Player
     addr_to_pid = {}    # (ip, port) -> pid
     next_pid = 1
@@ -86,8 +112,6 @@ def main():
             data, addr = sock.recvfrom(2048)
         except socket.timeout:
             data = None
-        except ConnectionResetError:
-         data = None
         except OSError:
             break
 
@@ -105,6 +129,7 @@ def main():
                     players[next_pid] = p
                     addr_to_pid[addr] = next_pid
                     print("[server] player %d registered from %s:%d" % (next_pid, addr[0], addr[1]), flush=True)
+                    control.send("REGISTER", addr[0], next_pid)
                     next_pid += 1
                 else:
                     p = None
@@ -119,7 +144,6 @@ def main():
                         p.last_seq = seq
                         p.x, p.y = x, y
                         log.writerow([p.pid, seq, "%.6f" % ts, "%.6f" % recv_ts])
-                        logf.flush()
                         rows += 1
                         total_rx += 1
                     else:                               # old or duplicate -> drop
@@ -136,6 +160,7 @@ def main():
             # drop players who went silent
             for pid_ in [i for i, p in players.items() if now - p.last_seen > PLAYER_TIMEOUT]:
                 print("[server] player %d timed out" % pid_, flush=True)
+                control.send("LEAVE", players[pid_].addr[0], pid_)
                 addr_to_pid.pop(players[pid_].addr, None)
                 del players[pid_]
             if players:
@@ -144,7 +169,14 @@ def main():
                     p.world_seq += 1
                     sock.sendto(pk.pack_world(p.world_seq, time.time(), snapshot), p.addr)
 
-      
+        if now >= next_announce:               # heartbeat to the SDN controller
+            next_announce += ANNOUNCE_EVERY
+            for p in players.values():
+                control.send("REGISTER", p.addr[0], p.pid)
+
+        if rows and rows % 200 == 0:
+            logf.flush()
+
     logf.flush()
     logf.close()
     print("[server] done. STATE packets accepted: %d" % total_rx, flush=True)

@@ -80,6 +80,39 @@ def combine(streams):
     }
 
 
+def burst_metrics(folder, rows):
+    """Only for burst scenarios (events.json exists): latency while the noise burst was on, and how fast
+    the SDN controller reacted (time from the start of the noise to the priority_on event).
+    rows = [(send_ts, recv_ts)] of all uplink packets."""
+    path = os.path.join(folder, "events.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        ev = json.load(f)
+    if "noise_start" not in ev:
+        return None
+    t0, t1 = ev["noise_start"], ev["noise_stop"]
+    window = [(r - s) * 1000.0 for s, r in rows if t0 <= r <= t1]
+    first_5s = [(r - s) * 1000.0 for s, r in rows if t0 <= r <= t0 + 5]
+    last_15s = [(r - s) * 1000.0 for s, r in rows if t1 - 15 <= r <= t1]
+    out = {"noise_seconds": t1 - t0,
+           "latency_mean_ms": mean(window), "latency_p95_ms": percentile(window, 95),
+           "latency_max_ms": max(window) if window else None,
+           "latency_first5s_mean_ms": mean(first_5s),     # includes the time before the controller reacts
+           "latency_last15s_mean_ms": mean(last_15s),     # after the controller has reacted
+           "reaction_s": None, "priority_off_after_s": None}
+    ctl = os.path.join(folder, "controller_events.csv")
+    if os.path.exists(ctl):
+        with open(ctl) as f:
+            for row in csv.DictReader(f):
+                t = float(row["time"])
+                if row["event"] == "priority_on" and out["reaction_s"] is None and t >= t0:
+                    out["reaction_s"] = t - t0
+                if row["event"] == "priority_off" and out["priority_off_after_s"] is None and t >= t1:
+                    out["priority_off_after_s"] = t - t1
+    return out
+
+
 def analyze(folder):
     # ---- uplink: server_log.csv, grouped by player_id ----
     per_player = {}
@@ -103,6 +136,10 @@ def analyze(folder):
 
     summary = {"scenario": os.path.basename(os.path.normpath(folder)),
                "players": len(per_player), "uplink": uplink, "downlink": downlink, "rtt": rtt}
+    all_rows = [(sd, rv) for v in per_player.values() for _, sd, rv in v]
+    burst = burst_metrics(folder, all_rows)
+    if burst:
+        summary["burst"] = burst
     with open(os.path.join(folder, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     return summary
@@ -122,6 +159,16 @@ def print_summary(s):
     r = s["rtt"]
     print("RTT (ping/pong): mean %s ms, p95 %s ms, max %s ms, %d samples"
           % (fmt(r["mean_ms"]), fmt(r["p95_ms"]), fmt(r["max_ms"]), r["samples"]))
+    b = s.get("burst")
+    if b:
+        print("During the %.0f s noise burst (uplink): latency mean %s ms, p95 %s ms, max %s ms"
+              % (b["noise_seconds"], fmt(b["latency_mean_ms"]), fmt(b["latency_p95_ms"]), fmt(b["latency_max_ms"])))
+        print("  first 5 s of the burst: mean %s ms;  last 15 s: mean %s ms"
+              % (fmt(b["latency_first5s_mean_ms"]), fmt(b["latency_last15s_mean_ms"])))
+        if b["reaction_s"] is not None:
+            print("  controller enabled priority %.1f s after the burst started" % b["reaction_s"])
+        if b["priority_off_after_s"] is not None:
+            print("  controller removed priority %.1f s after the burst ended" % b["priority_off_after_s"])
 
 
 if __name__ == "__main__":

@@ -11,12 +11,15 @@ gives game traffic priority over background traffic. We measure **latency, jitte
 | `server/server.py` | game server (registration, state, broadcast, logging) | Lead 1 |
 | `client/client.py` | game client/bot (sequence numbers, loss detection, RTT) | Lead 2 |
 | `sdn/topology.py` | Mininet network + bottleneck link + OVS queues | Lead 3 |
-| `sdn/controller.py` | Ryu OpenFlow app that prioritises game traffic | Lead 3 |
+| `sdn/controller.py` | Ryu OpenFlow app: static AND dynamic priority (reacts to congestion and to player events) | Lead 3 |
+| `sdn/policy.py` | congestion detector, player registry, control-message parser (unit tested) | Lead 3 |
 | `tools/noise.py` | background traffic generator (creates congestion) | Lead 4 |
 | `metrics/analyze.py` | latency / jitter / loss from the CSV logs | Lead 4 |
 | `metrics/plot.py` | graphs and results table | Lead 4 |
 | `experiments/run_experiment.py`, `run_all.sh` | runs the 4 test scenarios | Lead 4 |
-| `tests/test_protocol.py` | automated tests | Lead 5 |
+| `tests/test_protocol.py`, `tests/test_dynamic_sdn.py` | 26 automated tests | Lead 5 |
+| `docs/DOCUMENTATION.md` | **final documentation, organised by the evaluation criteria** | Lead 5 |
+| `docs/DYNAMIC_SDN_TEST.md` | **Lead 3: how to test the dynamic controller on the VM** | Lead 3 |
 | `docs/LEAD1..5_*.md` | **step-by-step guide + LLM prompts for each lead** | everyone |
 | `docs/REPORT_TEMPLATE.md` | report skeleton with draft text | Lead 5 |
 
@@ -55,11 +58,8 @@ sleep 12; python3 metrics/analyze.py results/local
 ```bash
 sudo apt update && sudo apt install -y mininet openvswitch-switch python3-pip
 sudo service openvswitch-switch start
-pip3 install matplotlib
-# Ryu needs a venv with pinned packages on Python 3.10 - follow docs/LEAD3_SDN.md Step 0:
-#   python3 -m venv ~/ryuenv && source ~/ryuenv/bin/activate
-#   pip install "setuptools<66" wheel && pip install eventlet==0.33.3 dnspython==2.2.1 ryu   (+ one-line wsgi.py patch)
-sudo bash experiments/run_all.sh                   # ~5 minutes, makes results/*.png
+pip3 install ryu eventlet==0.30.2 matplotlib      # see docs/LEAD3 if ryu complains
+sudo env "PATH=$PATH" bash experiments/run_all.sh   # 7 scenarios, ~10 minutes, makes results/*.png
 ```
 If Ryu will not install: `sudo bash experiments/run_all.sh none` uses static OVS rules instead (same queues, no controller).
 
